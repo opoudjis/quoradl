@@ -9,6 +9,9 @@ import time
 import argparse
 import sys
 import os
+import requests
+from email.mime.image import MIMEImage
+from mimetypes import guess_type
 
 
 logger = logging.getLogger("quora")
@@ -16,7 +19,7 @@ logger.addHandler(logging.StreamHandler())
 logger.setLevel(logging.DEBUG)
 
 
-def markdownify(span):
+def markdownify(span, folder):
     """
     Given a "span" element, returns a segment of markdown text
 
@@ -31,8 +34,7 @@ def markdownify(span):
         return ""
 
     if modifiers.get("image"):
-        img_url = modifiers.get("image")
-        return f"![]({img_url})"
+        return process_image(modifiers.get("image"), folder)
 
     bold = "__" if modifiers.get("bold") else ""
     italic = "_" if modifiers.get("italic") else ""
@@ -51,11 +53,36 @@ def markdownify(span):
         islink = "[", "]"
         target = f"({modifiers['link']['url']})"
 
+    if modifiers.get("embed"):
+        islink = "[", "]"
+        if not raw_text and modifiers['embed'].get('title'):
+            raw_text = f"{modifiers['embed'].get('title')}"
+        target = f"({modifiers['embed']['url']})"
+
     text = (
         f"{bold}{italic}{islink[0]}{raw_text}{islink[1]}{target}{italic}{bold}{postfix}"
     )
     return text
 
+def process_image(img_url, folder):
+        img_basename = img_url.split("/")[-1]
+        filename = img_basename
+        if folder:
+            filename = os.path.join(folder, filename)
+        with open(filename, 'wb') as file:
+            response = requests.get(img_url)
+            file.write(response.content)
+        (mimetype, encoding) = guess_type(filename)
+        if mimetype:
+            (maintype, subtype) = mimetype.split('/');
+        else:
+            subtype = "jpg"
+        img_basename = img_basename + "." + subtype
+        newname = img_basename
+        if folder:
+            newname = os.path.join(folder, newname)
+        os.rename(filename, newname)
+        return f"![]({img_basename})"
 
 def recurse_expand_json(js):
     # some of the structures inside the quora json are escaped string jsons,
@@ -143,7 +170,10 @@ def save_quora_answer(URL, filename=None, folder=None, force_lower=True):
     # trim to a legit filename
     if not filename:
         file_name_segments = URL.split("/")
-        answer_tag = file_name_segments.index("answer")
+        if "answer" in  file_name_segments:
+            answer_tag = file_name_segments.index("answer")
+        else:
+            answer_tag = 0
         file_name_base = file_name_segments[answer_tag - 1]
         # some question titles are super long,
         # so truncate them for windows
@@ -171,10 +201,39 @@ def save_quora_answer(URL, filename=None, folder=None, force_lower=True):
     # if the question has been deleted, the download will fail because the
     # downloader isn't logged in as you.. so skip:
 
-    is_deleted = qdata["answer"]["question"].get("isDeleted")
-    if is_deleted:
-        logger.warning(f"could not process {URL}, the question was deleted")
-        return False
+    if "answer" in qdata:
+        is_deleted = qdata["answer"]["question"].get("isDeleted")
+        if is_deleted:
+            logger.warning(f"could not process {URL}, the question was deleted")
+            return False
+
+    if "answer" in qdata:
+        container = qdata["answer"]
+    else:
+        container = qdata["tribeItem"]["post"]
+    
+    answer_content = container["content"]
+    found_text = False
+    for section in answer_content["sections"]:
+        for span in section["spans"]:
+            if span["text"]:
+                found_text = True
+    if not found_text:
+            logger.warning(f"could not process {URL}, the post is empty")
+            return False
+
+    # looks like 'updatedTime' is a different encoding??
+    date_time_int = container["creationTime"]
+    date_time_int /= 1000000
+    written_date = datetime.fromtimestamp(date_time_int).date().strftime("%Y-%m-%d")
+
+    space = "answer"
+    if file_name_segments[0] == "https:":
+        domain = file_name_segments[2].split(".")
+        if domain[0] != "www":
+            space = domain[0]
+
+    filename = written_date + "-" + space + "-" + filename
 
     if folder:
         filename = os.path.join(folder, filename)
@@ -183,53 +242,71 @@ def save_quora_answer(URL, filename=None, folder=None, force_lower=True):
     with open(f"{filename}", "w", encoding="utf-8") as out_file:
 
 
-        # lazy way wrangle the json payload
+            # lazy way wrangle the json payload
+    
 
-        title_block = qdata["answer"]["question"]["title"]
+        if "answer" in qdata:
+            title_block = qdata["answer"]["question"]["title"]
+        else:
+            title_block = qdata["tribeItem"]["post"]["title"]
+            if not title_block["sections"][0]["spans"][0]["text"]:
+                title_block = qdata["tribeItem"]["post"]["contentQtextDocument"]["contentEmbedSection"]["content"].get("title")
+            if not title_block or not title_block["sections"][0]["spans"][0]["text"]:
+                title_block = qdata["tribeItem"]["post"]["contentQtextDocument"]["contentEmbedSection"]["content"]["question"]["title"]
         title_section = title_block["sections"][0]
         title = title_section["spans"][0]["text"]
         out_file.write(f"# {title}\n\n")
-
-        # front matter
-
-        author = qdata["answer"]["author"]["names"][0]
+    
+            # front matter
+    
+        author = container["author"]["names"][0]
         fname = author["familyName"]
         gname = author["givenName"]
         if author["reverseOrder"]:
             fname, gname = gname, fname
-
+    
         out_file.write(f"\tauthor: {gname} {fname}\n")
-
+    
         # looks like 'updatedTime' is a different encoding??
-        date_time_int = qdata["answer"]["creationTime"]
+        date_time_int = container["creationTime"]
         date_time_int /= 1000000
-        out_file.write(f"\twritten: {datetime.fromtimestamp(date_time_int).date()}\n")
+        out_file.write(f"\twritten: {written_date}\n")
 
-        views = qdata["answer"]["numViews"]
-        votes = qdata["answer"]["numUpvotes"]
+        views = container["numViews"]
+        votes = container["numUpvotes"]
         out_file.write(f"\tviews: {views}\n")
         out_file.write(f"\tupvotes: {votes}\n")
+   
+  
+        out_file.write(f"\tquora url: {URL}\n")
+        question_url = container["url"]
+        if question_url != URL:
+            out_file.write(f"\tquestion url: {question_url}\n")
 
-
-        question_url = qdata["answer"]["url"]
-        out_file.write(f"\tquora url: {question_url}\n")
-
-        profile_url = qdata["answer"]["author"]["profileUrl"]
+        if "answer" not in qdata:
+            embed = container["content"]["sections"][0]["spans"][0]["modifiers"].get("embed")
+            if embed and embed.get("url"):
+                embed_url = embed.get("url")
+                out_file.write(f"\tembedded url: {embed_url}\n")
+    
+        profile_url = container["author"]["profileUrl"]
         out_file.write(f"\tauthor url: {profile_url}\n")
-
-        disclaimer = qdata["answer"].get("disclaimer")
+    
+        disclaimer = container.get("disclaimer")
         if disclaimer:
             out_file.write("\tdisclaimer:{disclaimer}\n")
+    
+            #repro = qdata["answer"]["isNotForReproduction"]
+            #if repro:
+                #out_file.write("\t**NOT FOR REPRODUCTION**\n")
 
-        repro = qdata["answer"]["isNotForReproduction"]
-        if repro:
-            out_file.write("\t**NOT FOR REPRODUCTION**\n")
 
         out_file.write("\n\n")
 
         # end front matter
 
-        answer_content = qdata["answer"]["content"]
+        answer_content = container["content"]
+            
 
         last_was_code = False
 
@@ -243,11 +320,20 @@ def save_quora_answer(URL, filename=None, folder=None, force_lower=True):
             if section["quoted"]:
                 out_file.write("> ")
 
+            if section["type"] == "unordered-list":
+                out_file.write(section["indent"] * "    " + "* ")
+
+            if section["type"] == "ordered-list":
+                out_file.write(section["indent"] * "    " + "1. ")
+
+            if section["type"] == "horizontal-rule":
+                out_file.write("___\n")
+
             for _ in range(section.get("indent")):
                 out_file.write("\t")
 
             for span in section["spans"]:
-                text = markdownify(span)
+                text = markdownify(span, folder)
                 out_file.write(text)
 
             # "sections" correspond to paragaraphs, so we add a markdown-friendly double
@@ -284,7 +370,7 @@ def answers_from_quora_html(contentfile):
         contents = htmlist.read()
         soup = BeautifulSoup(contents, "lxml")
 
-        for link in soup.findAll("a", attrs={"href": re.compile("/answer/")}):
+        for link in soup.findAll("a", attrs={"href": re.compile("/answer/|(?<!www)(?<!help)\.quora\.com/.")}):
             yield link.get("href")
 
 
@@ -428,4 +514,6 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Enhancements by Nick Nicholas, 2024
 """
