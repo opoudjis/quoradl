@@ -140,6 +140,9 @@ def get_quora_answer_data(URL):
         logger.warning("could not find end of answer json")
         return
 
+    # Quora occasionally fails to escape quotes, when they are deeply embedded escapes
+    raw_answer_json = re.sub('(?<=.)(?<!\\\)"(?=.)', '&quot;', raw_answer_json)
+
     try:
         raw_answer_json = json.loads(raw_answer_json)
     except:
